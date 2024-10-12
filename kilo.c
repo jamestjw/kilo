@@ -1,3 +1,5 @@
+/* includes */
+
 #include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
@@ -5,9 +7,25 @@
 #include <termios.h>
 #include <unistd.h>
 
+/* defines */
+
+#define DEBUG 0
+
+// Strip the 5th and 6th bits from alpha characters to give us something
+// between 1 - 26, i.e. the range of inputs of <ctrl-a> to <ctrl-z>
+#define CTRL_KEY(k) ((k) & 0x1f)
+
+/* data */
+
 struct termios orig_termios;
 
+/* terminal */
+
 void die(const char *s) {
+  // Refer to editorRefreshScreen for what these do
+  write(STDOUT_FILENO, "\x1b[2J", 4);
+  write(STDOUT_FILENO, "\x1b[H", 3);
+
   perror(s);
   exit(1);
 }
@@ -61,15 +79,18 @@ void enableRawMode() {
     die("tcsetattr");
 }
 
-int main() {
-  enableRawMode();
+char editorReadKey() {
+  int nread;
+  char c;
 
-  while (1) {
-    char c = '\0';
-
-    if (read(STDIN_FILENO, &c, 1) == -1 && errno != EAGAIN)
+  while ((nread = read(STDIN_FILENO, &c, 1)) != 1) {
+    if (nread == -1 && errno != EAGAIN)
       die("read");
+    // If nread is 0, we keep going until we get something
+  }
 
+  if (DEBUG) {
+    printf("Read key: ");
     // Since we turned of OPOST, we need to manually add carriage returns
     if (iscntrl(c)) {
       // Control characters can't be printed, so we just print their ASCII
@@ -78,9 +99,49 @@ int main() {
     } else {
       printf("%d (%c)\r\n", c, c);
     }
+  }
 
-    if (c == 'q')
-      break;
+  return c;
+}
+
+/* output */
+
+// Escape sequences: https://vt100.net/docs/vt100-ug/chapter3.html
+// \x1b - escape
+// J    - erase in display
+// 2    - clear entire screen (other options are 0 and 1, check docs)
+void editorRefreshScreen() {
+  // This erases the screen and places the cursor at the bottom left
+  write(STDOUT_FILENO, "\x1b[2J", 4);
+  // The `H` command repositions the cursor, its default args place the cursor
+  // at the top left, exactly where we want it.
+  write(STDOUT_FILENO, "\x1b[H", 3);
+}
+
+/* input */
+
+void editorProcessKeypress() {
+  char c = editorReadKey();
+
+  switch (c) {
+  case CTRL_KEY('q'): {
+    // Refer to editorRefreshScreen for what these do
+    write(STDOUT_FILENO, "\x1b[2J", 4);
+    write(STDOUT_FILENO, "\x1b[H", 3);
+    exit(0);
+    break;
+  }
+  }
+}
+
+/* init */
+
+int main() {
+  enableRawMode();
+
+  while (1) {
+    editorRefreshScreen();
+    editorProcessKeypress();
   }
 
   return 0;

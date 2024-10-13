@@ -1,9 +1,11 @@
 /* includes */
 
+#include <asm-generic/ioctls.h>
 #include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/ioctl.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -17,7 +19,14 @@
 
 /* data */
 
-struct termios orig_termios;
+struct editorConfig {
+  int screenrows;
+  int screencols;
+  struct termios orig_termios;
+};
+
+// Global struct containing editor state
+struct editorConfig E;
 
 /* terminal */
 
@@ -31,18 +40,18 @@ void die(const char *s) {
 }
 
 void disableRawMode() {
-  if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios) == -1)
+  if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &E.orig_termios) == -1)
     die("tcsetattr");
 }
 
 void enableRawMode() {
-  if (tcgetattr(STDIN_FILENO, &orig_termios) == -1)
+  if (tcgetattr(STDIN_FILENO, &E.orig_termios) == -1)
     die("tcgetattr");
 
   // We want to disable raw mode when the app is killed
   atexit(disableRawMode);
 
-  struct termios raw = orig_termios;
+  struct termios raw = E.orig_termios;
 
   // Turn off a few local flags
   // 1. echo mode, i.e. what is typed by the users will not be printed
@@ -104,7 +113,66 @@ char editorReadKey() {
   return c;
 }
 
+int getCursorPosition(int *rows, int *cols) {
+  char buf[32];
+  unsigned int i = 0;
+  // Use the device status report `n` command with an argument of 6 to get the
+  // current cursor position
+  if (write(STDOUT_FILENO, "\x1b[6n", 4) != 4)
+    return -1;
+
+  // We expect to be able to read an input of the format \x1b[24;80R or
+  // something of this format, where 24 is the height and 80 is the width
+  while (i < sizeof(buf) - 1) {
+    if (read(STDIN_FILENO, &buf[i], 1) != 1)
+      break;
+    if (buf[i] == 'R')
+      break;
+    i++;
+  }
+  // Conveniently replace the `R` with a null-byte
+  buf[i] = '\0';
+
+  if (buf[0] != '\x1b' || buf[1] != '[')
+    return -1;
+  if (sscanf(&buf[2], "%d;%d", rows, cols) != 2)
+    return -1;
+
+  return 0;
+}
+
+// Get screen height and width
+int getWindowSize(int *rows, int *cols) {
+  struct winsize ws;
+
+  // TIOCGWINSZ stands for Terminal IOCtl Get WINdow SiZe
+  if (1 || ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0) {
+    // Fallback method to get window size, we move the cursor to the bottom
+    // right, i.e. 999 columns (C) to the right, and 999 columns down (B)
+    if (write(STDOUT_FILENO, "\x1b[999C\x1b[999B", 12) != 12)
+      return -1;
+    return getCursorPosition(rows, cols);
+  } else {
+    *cols = ws.ws_col;
+    *rows = ws.ws_row;
+    return 0;
+  }
+}
+
 /* output */
+
+void editorDrawRows() {
+  // Drawing tildes on rows that aren't part of the file being edited
+  for (int y = 0; y < E.screenrows; y++) {
+    write(STDOUT_FILENO, "~", 1);
+
+    // When we get to the very last row, we don't want to print a newline as
+    // this causes the screen to scroll
+    if (y < E.screenrows - 1) {
+      write(STDOUT_FILENO, "\r\n", 2);
+    }
+  }
+}
 
 // Escape sequences: https://vt100.net/docs/vt100-ug/chapter3.html
 // \x1b - escape
@@ -115,6 +183,10 @@ void editorRefreshScreen() {
   write(STDOUT_FILENO, "\x1b[2J", 4);
   // The `H` command repositions the cursor, its default args place the cursor
   // at the top left, exactly where we want it.
+  write(STDOUT_FILENO, "\x1b[H", 3);
+
+  // Draw rows and reposition cursor
+  editorDrawRows();
   write(STDOUT_FILENO, "\x1b[H", 3);
 }
 
@@ -136,8 +208,14 @@ void editorProcessKeypress() {
 
 /* init */
 
+void initEditor() {
+  if (getWindowSize(&E.screenrows, &E.screencols) == -1)
+    die("getWindowSize");
+}
+
 int main() {
   enableRawMode();
+  initEditor();
 
   while (1) {
     editorRefreshScreen();

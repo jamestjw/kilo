@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/ioctl.h>
 #include <termios.h>
 #include <unistd.h>
@@ -16,6 +17,8 @@
 // Strip the 5th and 6th bits from alpha characters to give us something
 // between 1 - 26, i.e. the range of inputs of <ctrl-a> to <ctrl-z>
 #define CTRL_KEY(k) ((k) & 0x1f)
+
+#define KILO_VERSION "0.0.1"
 
 /* data */
 
@@ -159,17 +162,65 @@ int getWindowSize(int *rows, int *cols) {
   }
 }
 
+/* append buffer */
+
+struct abuf {
+  char *b;
+  int len;
+};
+
+#define ABUF_INIT {NULL, 0}
+
+void abAppend(struct abuf *ab, const char *s, int len) {
+  char *new = realloc(ab->b, ab->len + len);
+
+  if (new == NULL)
+    return;
+  memcpy(&new[ab->len], s, len);
+  ab->b = new;
+  ab->len += len;
+}
+
+void abFree(struct abuf *ab) { free(ab->b); }
+
 /* output */
 
-void editorDrawRows() {
+// Should be called with the cursor at the top right
+void editorDrawRows(struct abuf *ab) {
   // Drawing tildes on rows that aren't part of the file being edited
   for (int y = 0; y < E.screenrows; y++) {
-    write(STDOUT_FILENO, "~", 1);
+    if (y == E.screenrows / 3) {
+      char welcome[80];
+      int len = snprintf(welcome, sizeof(welcome), "Kilo editor -- version %s",
+                         KILO_VERSION);
+
+      // Truncate welcome message if we don't have enough space
+      if (len > E.screencols)
+        len = E.screencols;
+
+      // Centralise message with padding
+      int padding = (E.screencols - len) / 2;
+
+      if (padding) {
+        abAppend(ab, "~", 1);
+        padding--;
+      }
+      while (padding--)
+        abAppend(ab, " ", 1);
+
+      abAppend(ab, welcome, len);
+    } else {
+      abAppend(ab, "~", 1);
+    }
+
+    // K (erase in line) with the default argument 0, erases the part of the
+    // line to the right of the cursor.
+    abAppend(ab, "\x1b[K", 3);
 
     // When we get to the very last row, we don't want to print a newline as
     // this causes the screen to scroll
     if (y < E.screenrows - 1) {
-      write(STDOUT_FILENO, "\r\n", 2);
+      abAppend(ab, "\r\n", 2);
     }
   }
 }
@@ -179,15 +230,25 @@ void editorDrawRows() {
 // J    - erase in display
 // 2    - clear entire screen (other options are 0 and 1, check docs)
 void editorRefreshScreen() {
-  // This erases the screen and places the cursor at the bottom left
-  write(STDOUT_FILENO, "\x1b[2J", 4);
+  struct abuf ab = ABUF_INIT;
+
+  // Use the l command (reset mode) with argument `?25` to hide the cursor
+  // while we redraw the screen.
+  abAppend(&ab, "\x1b[?25l", 6);
+
   // The `H` command repositions the cursor, its default args place the cursor
   // at the top left, exactly where we want it.
-  write(STDOUT_FILENO, "\x1b[H", 3);
+  abAppend(&ab, "\x1b[H", 3);
 
   // Draw rows and reposition cursor
-  editorDrawRows();
-  write(STDOUT_FILENO, "\x1b[H", 3);
+  editorDrawRows(&ab);
+  abAppend(&ab, "\x1b[H", 3);
+
+  // Use the h command (set mode) to restore the cursor
+  abAppend(&ab, "\x1b[?25h", 6);
+
+  write(STDOUT_FILENO, ab.b, ab.len);
+  abFree(&ab);
 }
 
 /* input */

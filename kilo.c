@@ -1,7 +1,6 @@
 /* includes */
 
 #include <asm-generic/ioctls.h>
-#include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,11 +17,26 @@
 // between 1 - 26, i.e. the range of inputs of <ctrl-a> to <ctrl-z>
 #define CTRL_KEY(k) ((k) & 0x1f)
 
+enum editorKey {
+  // These need to be out of the range of normal chars
+  ARROW_LEFT = 1000, /* \x1b[D */
+  ARROW_RIGHT,       /* \x1b[C */
+  ARROW_UP,          /* \x1b[A, */
+  ARROW_DOWN,        /* \x1b[B */
+  DEL_KEY,           /* <esc>[3~ */
+  HOME_KEY,          /* <esc>[1~, <esc>[7~, <esc>[H, or <esc>OH */
+  END_KEY,           /* <esc>[4~, <esc>[8~, <esc>[F, or <esc>OF */
+  PAGE_UP,           /* <esc>[5~ */
+  PAGE_DOWN,         /* <esc>[6~ */
+};
+
 #define KILO_VERSION "0.0.1"
 
 /* data */
 
 struct editorConfig {
+  // Cursor coordinates, (0, 0) is the top left
+  int cx, cy;
   int screenrows;
   int screencols;
   struct termios orig_termios;
@@ -91,7 +105,7 @@ void enableRawMode() {
     die("tcsetattr");
 }
 
-char editorReadKey() {
+int editorReadKey() {
   int nread;
   char c;
 
@@ -101,19 +115,73 @@ char editorReadKey() {
     // If nread is 0, we keep going until we get something
   }
 
-  if (DEBUG) {
-    printf("Read key: ");
-    // Since we turned of OPOST, we need to manually add carriage returns
-    if (iscntrl(c)) {
-      // Control characters can't be printed, so we just print their ASCII
-      // value
-      printf("%d\r\n", c);
-    } else {
-      printf("%d (%c)\r\n", c, c);
-    }
-  }
+  // Escape character
+  if (c == '\x1b') {
+    char seq[3];
 
-  return c;
+    // Check if we have enough keys in the escape sequence
+    if (read(STDIN_FILENO, &seq[0], 1) != 1)
+      return '\x1b';
+    if (read(STDIN_FILENO, &seq[1], 1) != 1)
+      return '\x1b';
+
+    if (seq[0] == '[') {
+      if ('0' <= seq[1] && seq[1] <= '9') {
+        if (read(STDIN_FILENO, &seq[2], 1) != 1)
+          return '\x1b';
+        // `PgUp` is sent as `<esc>[5~` and `PgDown` is sent as `<esc>[6~`
+        if (seq[2] == '~') {
+          switch (seq[1]) {
+          case '1':
+            return HOME_KEY;
+          case '3':
+            return DEL_KEY;
+          case '4':
+            return END_KEY;
+          case '5':
+            return PAGE_UP;
+          case '6':
+            return PAGE_DOWN;
+          case '7':
+            return HOME_KEY;
+          case '8':
+            return END_KEY;
+          }
+        }
+      } else {
+        switch (seq[1]) {
+
+        // Up, down, left, right arrows are mapped to
+        // \x1b[A, \x1b[B, \x1b[D, \x1b[C respectively
+        // Alias arrow keys to `hjkl`
+        case 'A':
+          return ARROW_UP;
+        case 'B':
+          return ARROW_DOWN;
+        case 'C':
+          return ARROW_RIGHT;
+        case 'D':
+          return ARROW_LEFT;
+        case 'H':
+          return HOME_KEY;
+        case 'F':
+          return END_KEY;
+        }
+      }
+    } else if (seq[0] == 'O') {
+      switch (seq[1]) {
+      case 'H':
+        return HOME_KEY;
+      case 'F':
+        return END_KEY;
+      }
+    }
+
+    // Assume user just hit `ESC`
+    return '\x1b';
+  } else {
+    return c;
+  }
 }
 
 int getCursorPosition(int *rows, int *cols) {
@@ -240,9 +308,14 @@ void editorRefreshScreen() {
   // at the top left, exactly where we want it.
   abAppend(&ab, "\x1b[H", 3);
 
-  // Draw rows and reposition cursor
+  // Draw rows
   editorDrawRows(&ab);
-  abAppend(&ab, "\x1b[H", 3);
+
+  // Reposition cursor
+  char buf[32];
+  // The `H` command repositions the cursor and 1-indexed
+  snprintf(buf, sizeof(buf), "\x1b[%d;%dH", E.cy + 1, E.cx + 1);
+  abAppend(&ab, buf, strlen(buf));
 
   // Use the h command (set mode) to restore the cursor
   abAppend(&ab, "\x1b[?25h", 6);
@@ -253,8 +326,29 @@ void editorRefreshScreen() {
 
 /* input */
 
+void editorMoveCursor(int key) {
+  switch (key) {
+  case ARROW_LEFT:
+    if (E.cx != 0)
+      E.cx--;
+    break;
+  case ARROW_RIGHT:
+    if (E.cx != E.screencols - 1)
+      E.cx++;
+    break;
+  case ARROW_UP:
+    if (E.cy != 0)
+      E.cy--;
+    break;
+  case ARROW_DOWN:
+    if (E.cy != E.screenrows - 1)
+      E.cy++;
+    break;
+  }
+}
+
 void editorProcessKeypress() {
-  char c = editorReadKey();
+  int c = editorReadKey();
 
   switch (c) {
   case CTRL_KEY('q'): {
@@ -264,12 +358,37 @@ void editorProcessKeypress() {
     exit(0);
     break;
   }
+  // Go to the left and right edges of the screen for now
+  case HOME_KEY:
+    E.cx = 0;
+    break;
+  case END_KEY:
+    E.cx = E.screencols - 1;
+    break;
+  case PAGE_UP:
+  case PAGE_DOWN: {
+    // Either go all the way up or down
+    int times = E.screenrows;
+    while (times--) {
+      editorMoveCursor(c == PAGE_UP ? ARROW_UP : ARROW_DOWN);
+    }
+    break;
+  }
+  case ARROW_UP:
+  case ARROW_DOWN:
+  case ARROW_LEFT:
+  case ARROW_RIGHT: {
+    editorMoveCursor(c);
+    break;
+  }
   }
 }
 
 /* init */
 
 void initEditor() {
+  E.cx = E.cy = 0;
+
   if (getWindowSize(&E.screenrows, &E.screencols) == -1)
     die("getWindowSize");
 }

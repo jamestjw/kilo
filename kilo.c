@@ -15,6 +15,8 @@
 
 /* defines */
 
+#define KILO_VERSION "0.0.1"
+#define KILO_TAB_STOP 8
 #define DEBUG 0
 
 // Strip the 5th and 6th bits from alpha characters to give us something
@@ -34,18 +36,24 @@ enum editorKey {
   PAGE_DOWN,         /* <esc>[6~ */
 };
 
-#define KILO_VERSION "0.0.1"
-
 /* data */
 
 typedef struct erow {
   int size;
+  int rsize;
   char *chars;
+  char *render;
 } erow;
 
 struct editorConfig {
-  // Cursor coordinates, (0, 0) is the top left
+  // Cursor coordinates within the open file, (0, 0) is the top left
   int cx, cy;
+  // The x coordinates within the rendered string of the curr row
+  int rx;
+  // Row offset, i.e. which row the user is scrolled to (1st visible row)
+  int rowoff;
+  // Column offset, i.e. which column the user is scrolled to (1st visible col)
+  int coloff;
   int screenrows;
   int screencols;
   int numrows;
@@ -242,6 +250,46 @@ int getWindowSize(int *rows, int *cols) {
 }
 
 /* row operations */
+
+int editorRowCxToRx(erow *row, int cx) {
+  int rx = 0;
+  for (int j = 0; j < cx; j++) {
+    if (row->chars[j] == '\t') {
+      rx += (KILO_TAB_STOP - 1) - (rx % KILO_TAB_STOP);
+    }
+    rx++;
+  }
+  return rx;
+}
+
+// Figures out what to render for each row and updates row->render.
+// Also takes care of freeing what was previously there.
+void editorUpdateRow(erow *row) {
+  int tabs = 0;
+  for (int j = 0; j < row->size; j++)
+    if (row->chars[j] == '\t')
+      tabs++;
+
+  free(row->render);
+
+  // The max number of characters we need for each tab is 8, hence we add 7
+  // more for each tab.
+  row->render = malloc(row->size + tabs * (KILO_TAB_STOP - 1) + 1);
+
+  int idx = 0;
+  for (int j = 0; j < row->size; j++) {
+    if (row->chars[j] == '\t') {
+      row->render[idx++] = ' ';
+      while (idx % KILO_TAB_STOP != 0)
+        row->render[idx++] = ' ';
+    } else {
+      row->render[idx++] = row->chars[j];
+    }
+  }
+  row->render[idx] = '\0';
+  row->rsize = idx;
+}
+
 void editorAppendRow(char *s, size_t len) {
   E.row = realloc(E.row, sizeof(erow) * (E.numrows + 1));
 
@@ -250,6 +298,12 @@ void editorAppendRow(char *s, size_t len) {
   E.row[idx].chars = malloc(len + 1);
   memcpy(E.row[idx].chars, s, len);
   E.row[idx].chars[len] = '\0';
+
+  E.row[idx].rsize = 0;
+  E.row[idx].render = NULL;
+
+  editorUpdateRow(&E.row[idx]);
+
   E.numrows++;
 }
 
@@ -297,11 +351,39 @@ void abFree(struct abuf *ab) { free(ab->b); }
 
 /* output */
 
+void editorScroll() {
+  E.rx = 0;
+  if (E.cy < E.numrows) {
+    E.rx = editorRowCxToRx(&E.row[E.cy], E.cx);
+  }
+
+  // If the cursor is above the visible window, set the offset to where the
+  // cursor is so that the cursor becomes visible
+  if (E.cy < E.rowoff) {
+    E.rowoff = E.cy;
+  }
+
+  // Check if cursor is below the visible window
+  if (E.cy >= E.rowoff + E.screenrows) {
+    E.rowoff = E.cy - E.screenrows + 1;
+  }
+
+  // Same as above code for vertical scrolling
+  if (E.rx < E.coloff) {
+    E.coloff = E.rx;
+  }
+
+  if (E.rx >= E.coloff + E.screencols) {
+    E.coloff = E.rx - E.screencols + 1;
+  }
+}
+
 // Should be called with the cursor at the top right
 void editorDrawRows(struct abuf *ab) {
   // Drawing tildes on rows that aren't part of the file being edited
   for (int y = 0; y < E.screenrows; y++) {
-    if (y >= E.numrows) {
+    int filerow = y + E.rowoff;
+    if (filerow >= E.numrows) {
       // Only print if user didn't open a file
       if (E.numrows == 0 && y == E.screenrows / 3) {
         char welcome[80];
@@ -327,10 +409,13 @@ void editorDrawRows(struct abuf *ab) {
         abAppend(ab, "~", 1);
       }
     } else {
-      int len = E.row[y].size;
-      if (len > E.screencols)
+      int len = E.row[filerow].rsize - E.coloff;
+      // In case the user scrolled off the end of the line
+      if (len < 0)
+        len = 0;
+      else if (len > E.screencols)
         len = E.screencols;
-      abAppend(ab, E.row[y].chars, len);
+      abAppend(ab, &E.row[filerow].render[E.coloff], len);
     }
 
     // K (erase in line) with the default argument 0, erases the part of the
@@ -350,6 +435,8 @@ void editorDrawRows(struct abuf *ab) {
 // J    - erase in display
 // 2    - clear entire screen (other options are 0 and 1, check docs)
 void editorRefreshScreen() {
+  editorScroll();
+
   struct abuf ab = ABUF_INIT;
 
   // Use the l command (reset mode) with argument `?25` to hide the cursor
@@ -366,7 +453,8 @@ void editorRefreshScreen() {
   // Reposition cursor
   char buf[32];
   // The `H` command repositions the cursor and 1-indexed
-  snprintf(buf, sizeof(buf), "\x1b[%d;%dH", E.cy + 1, E.cx + 1);
+  snprintf(buf, sizeof(buf), "\x1b[%d;%dH", E.cy - E.rowoff + 1,
+           E.rx - E.coloff + 1);
   abAppend(&ab, buf, strlen(buf));
 
   // Use the h command (set mode) to restore the cursor
@@ -379,23 +467,48 @@ void editorRefreshScreen() {
 /* input */
 
 void editorMoveCursor(int key) {
+  // Row where the cursor currently is
+  erow *row = (E.cy >= E.numrows) ? NULL : &E.row[E.cy];
+
   switch (key) {
   case ARROW_LEFT:
-    if (E.cx != 0)
+    if (E.cx != 0) {
       E.cx--;
+    } else if (E.cy > 0) {
+      // If the user is not on the first line and is at the far left of a line,
+      // allow the user to go up to the previous line
+      E.cy--;
+      E.cx = E.row[E.cy].size;
+    }
     break;
   case ARROW_RIGHT:
-    if (E.cx != E.screencols - 1)
+    if (row && E.cx < row->size) {
       E.cx++;
+    } else if (row && E.cx == row->size) {
+      // Allow the user to run off the end of a line to the next line if he
+      // isn't already on the last row
+      E.cy++;
+      E.cx = 0;
+    }
     break;
   case ARROW_UP:
     if (E.cy != 0)
       E.cy--;
     break;
   case ARROW_DOWN:
-    if (E.cy != E.screenrows - 1)
+    // We can advance below the bottom of the screen, but not beyond the file
+    if (E.cy < E.numrows)
       E.cy++;
     break;
+  }
+
+  // Get new row as we may have moved
+  row = (E.cy >= E.numrows) ? NULL : &E.row[E.cy];
+  int rowlen = row ? row->size : 0;
+  // If we moved from a longer line to a shorter line, ensure that the current
+  // `cx` does not exceed the length of the current line
+  if (E.cx > rowlen) {
+    E.cx = rowlen;
   }
 }
 
@@ -415,11 +528,21 @@ void editorProcessKeypress() {
     E.cx = 0;
     break;
   case END_KEY:
-    E.cx = E.screencols - 1;
+    if (E.cy < E.numrows)
+      E.cx = E.row[E.cy].size;
     break;
   case PAGE_UP:
   case PAGE_DOWN: {
-    // Either go all the way up or down
+    // Put the cursor at the very top or bottom of the screen
+    if (c == PAGE_UP) {
+      E.cy = E.rowoff;
+    } else if (c == PAGE_DOWN) {
+      E.cy = E.rowoff + E.screenrows - 1;
+      if (E.cy > E.numrows) {
+        E.cy = E.numrows;
+      }
+    }
+    // And move up/down an entire screen
     int times = E.screenrows;
     while (times--) {
       editorMoveCursor(c == PAGE_UP ? ARROW_UP : ARROW_DOWN);
@@ -439,7 +562,7 @@ void editorProcessKeypress() {
 /* init */
 
 void initEditor() {
-  E.cx = E.cy = E.numrows = 0;
+  E.cx = E.cy = E.rx = E.rowoff = E.coloff = E.numrows = 0;
   E.row = NULL;
 
   if (getWindowSize(&E.screenrows, &E.screencols) == -1)

@@ -21,7 +21,7 @@
 
 // Strip the 5th and 6th bits from alpha characters to give us something
 // between 1 - 26, i.e. the range of inputs of <ctrl-a> to <ctrl-z>
-#define CTRL_KEY(k) ((k) & 0x1f)
+#define CTRL_KEY(k) ((k)&0x1f)
 
 enum editorKey {
   // These need to be out of the range of normal chars
@@ -58,6 +58,7 @@ struct editorConfig {
   int screencols;
   int numrows;
   erow *row;
+  char *filename;
   struct termios orig_termios;
 };
 
@@ -310,6 +311,9 @@ void editorAppendRow(char *s, size_t len) {
 /* file i/o */
 
 void editorOpen(char *filename) {
+  free(E.filename);
+  E.filename = strdup(filename);
+
   FILE *fp = fopen(filename, "r");
   if (!fp)
     die("fopen");
@@ -335,7 +339,8 @@ struct abuf {
   int len;
 };
 
-#define ABUF_INIT {NULL, 0}
+#define ABUF_INIT                                                              \
+  { NULL, 0 }
 
 void abAppend(struct abuf *ab, const char *s, int len) {
   char *new = realloc(ab->b, ab->len + len);
@@ -422,12 +427,36 @@ void editorDrawRows(struct abuf *ab) {
     // line to the right of the cursor.
     abAppend(ab, "\x1b[K", 3);
 
-    // When we get to the very last row, we don't want to print a newline as
-    // this causes the screen to scroll
-    if (y < E.screenrows - 1) {
-      abAppend(ab, "\r\n", 2);
-    }
+    abAppend(ab, "\r\n", 2);
   }
+}
+
+void editorDrawStatusBar(struct abuf *ab) {
+  // Use inverted colour formatting
+  abAppend(ab, "\x1b[7m", 4);
+
+  char status[80], rstatus[80];
+  int len = snprintf(status, sizeof(status), "%.20s - %d lines",
+                     E.filename ? E.filename : "[No Name]", E.numrows);
+  int rlen = snprintf(rstatus, sizeof(rstatus), "%d/%d", E.cy, E.numrows - 1);
+  if (len > E.screencols) {
+    len = E.screencols;
+  }
+  abAppend(ab, status, len);
+
+  while (len < E.screencols) {
+    if (E.screencols - len == rlen) {
+      abAppend(ab, rstatus, rlen);
+      break;
+    }
+
+    // Padding between left and right
+    abAppend(ab, " ", 1);
+    len++;
+  }
+
+  // Switch back to normal formatting
+  abAppend(ab, "\x1b[m", 3);
 }
 
 // Escape sequences: https://vt100.net/docs/vt100-ug/chapter3.html
@@ -447,8 +476,9 @@ void editorRefreshScreen() {
   // at the top left, exactly where we want it.
   abAppend(&ab, "\x1b[H", 3);
 
-  // Draw rows
+  // Draw rows and status bar
   editorDrawRows(&ab);
+  editorDrawStatusBar(&ab);
 
   // Reposition cursor
   char buf[32];
@@ -564,9 +594,13 @@ void editorProcessKeypress() {
 void initEditor() {
   E.cx = E.cy = E.rx = E.rowoff = E.coloff = E.numrows = 0;
   E.row = NULL;
+  E.filename = NULL;
 
   if (getWindowSize(&E.screenrows, &E.screencols) == -1)
     die("getWindowSize");
+
+  // Reserve one line for the status bar
+  E.screenrows -= 1;
 }
 
 int main(int argc, char *argv[]) {

@@ -1,19 +1,21 @@
-/* includes */
+/* Includes */
 
 #define _DEFAULT_SOURCE
 #define _BSD_SOURCE
 #define _GNU_SOURCE
 
 #include <errno.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
-/* defines */
+/* Defines */
 
 #define KILO_VERSION "0.0.1"
 #define KILO_TAB_STOP 8
@@ -21,7 +23,7 @@
 
 // Strip the 5th and 6th bits from alpha characters to give us something
 // between 1 - 26, i.e. the range of inputs of <ctrl-a> to <ctrl-z>
-#define CTRL_KEY(k) ((k)&0x1f)
+#define CTRL_KEY(k) ((k) & 0x1f)
 
 enum editorKey {
   // These need to be out of the range of normal chars
@@ -36,7 +38,7 @@ enum editorKey {
   PAGE_DOWN,         /* <esc>[6~ */
 };
 
-/* data */
+/* Data */
 
 typedef struct erow {
   int size;
@@ -48,7 +50,7 @@ typedef struct erow {
 struct editorConfig {
   // Cursor coordinates within the open file, (0, 0) is the top left
   int cx, cy;
-  // The x coordinates within the rendered string of the curr row
+  // The x coordinates within the rendered string of the current row
   int rx;
   // Row offset, i.e. which row the user is scrolled to (1st visible row)
   int rowoff;
@@ -59,13 +61,16 @@ struct editorConfig {
   int numrows;
   erow *row;
   char *filename;
+  // The message we display in the status bar as well as when it was set
+  char statusmsg[80];
+  time_t statusmsg_time;
   struct termios orig_termios;
 };
 
 // Global struct containing editor state
 struct editorConfig E;
 
-/* terminal */
+/* Terminal */
 
 void die(const char *s) {
   // Refer to editorRefreshScreen for what these do
@@ -339,8 +344,7 @@ struct abuf {
   int len;
 };
 
-#define ABUF_INIT                                                              \
-  { NULL, 0 }
+#define ABUF_INIT {NULL, 0}
 
 void abAppend(struct abuf *ab, const char *s, int len) {
   char *new = realloc(ab->b, ab->len + len);
@@ -457,6 +461,19 @@ void editorDrawStatusBar(struct abuf *ab) {
 
   // Switch back to normal formatting
   abAppend(ab, "\x1b[m", 3);
+  abAppend(ab, "\r\n", 2);
+}
+
+void editorDrawMessageBar(struct abuf *ab) {
+  // Clear the message bar
+  abAppend(ab, "\x1b[K", 3);
+
+  int msglen = strlen(E.statusmsg);
+  if (msglen > E.screencols) {
+    msglen = E.screencols;
+  }
+  if (msglen && time(NULL) - E.statusmsg_time < 5)
+    abAppend(ab, E.statusmsg, msglen);
 }
 
 // Escape sequences: https://vt100.net/docs/vt100-ug/chapter3.html
@@ -479,6 +496,7 @@ void editorRefreshScreen() {
   // Draw rows and status bar
   editorDrawRows(&ab);
   editorDrawStatusBar(&ab);
+  editorDrawMessageBar(&ab);
 
   // Reposition cursor
   char buf[32];
@@ -494,7 +512,17 @@ void editorRefreshScreen() {
   abFree(&ab);
 }
 
-/* input */
+void editorSetStatusMessage(const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(E.statusmsg, sizeof(E.statusmsg), fmt, ap);
+  va_end(ap);
+
+  // Get current time
+  E.statusmsg_time = time(NULL);
+}
+
+/* Input */
 
 void editorMoveCursor(int key) {
   // Row where the cursor currently is
@@ -589,18 +617,20 @@ void editorProcessKeypress() {
   }
 }
 
-/* init */
+/* Init */
 
 void initEditor() {
   E.cx = E.cy = E.rx = E.rowoff = E.coloff = E.numrows = 0;
   E.row = NULL;
   E.filename = NULL;
+  E.statusmsg[0] = '\0';
+  E.statusmsg_time = 0;
 
   if (getWindowSize(&E.screenrows, &E.screencols) == -1)
     die("getWindowSize");
 
   // Reserve one line for the status bar
-  E.screenrows -= 1;
+  E.screenrows -= 2;
 }
 
 int main(int argc, char *argv[]) {
@@ -608,6 +638,8 @@ int main(int argc, char *argv[]) {
   initEditor();
   if (argc >= 2)
     editorOpen(argv[1]);
+
+  editorSetStatusMessage("HELP: Ctrl-Q = quit");
 
   while (1) {
     editorRefreshScreen();

@@ -5,6 +5,7 @@
 #define _GNU_SOURCE
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,6 +27,7 @@
 #define CTRL_KEY(k) ((k) & 0x1f)
 
 enum editorKey {
+  BACKSPACE = 127,
   // These need to be out of the range of normal chars
   ARROW_LEFT = 1000, /* \x1b[D */
   ARROW_RIGHT,       /* \x1b[C */
@@ -70,6 +72,9 @@ struct editorConfig {
 // Global struct containing editor state
 struct editorConfig E;
 
+/* Prototypes */
+void editorSetStatusMessage(const char *fmt, ...);
+
 /* Terminal */
 
 void die(const char *s) {
@@ -96,9 +101,9 @@ void enableRawMode() {
   struct termios raw = E.orig_termios;
 
   // Turn off a few local flags
-  // 1. echo mode, i.e. what is typed by the users will not be printed
+  // 1. Echo mode, i.e. what is typed by the users will not be printed
   //    on the screen
-  // 2. canonical mode so that we don't read line-by-line, i.e. we get
+  // 2. Canonical mode so that we don't read line-by-line, i.e. we get
   //    each char as it comes in
   // 3. SIGINT, i.e. prevent <ctrl-c> from terminating the program
   //    and SIGSTP, i.e. prevent <ctrl-z> from suspending the program
@@ -108,7 +113,7 @@ void enableRawMode() {
   // Turn off some input flags
   // 1. XOFF and XON, i.e. <ctrl-s> and <ctrl-q> that pause and resume
   //    transmission of characters
-  // 2. the automatic conversion of carriage returns into newlines
+  // 2. The automatic conversion of carriage returns into newlines
   // ... and some other probably obsolete stuff
   // 3. BRKINT, a break condition will cause a SIGINT signal to be sent to the
   //    program
@@ -116,7 +121,7 @@ void enableRawMode() {
   // 5. ISTRIP causes the 8th bit of each input byte to be stripped
   raw.c_iflag &= ~(IXON | ICRNL | BRKINT | INPCK | ISTRIP);
   // Turn off output flags
-  // 1. the conversion of newlines into a carriage return followed by a newline
+  // 1. The conversion of newlines into a carriage return followed by a newline
   raw.c_oflag &= ~(OPOST);
   // Set the character size (CS) to 8 bits per byte
   raw.c_cflag |= (CS8);
@@ -313,7 +318,53 @@ void editorAppendRow(char *s, size_t len) {
   E.numrows++;
 }
 
-/* file i/o */
+void editorRowInsertChar(erow *row, int at, int c) {
+  // Allowing going one index more than the row size to allow appending to
+  // a row
+  if (at < 0 || at > row->size)
+    at = row->size;
+
+  row->chars = realloc(row->chars, row->size + 2);
+  memmove(&row->chars[at + 1], &row->chars[at], row->size - at + 1);
+  row->size++;
+  row->chars[at] = c;
+  // Update `render` and `rsize` fields
+  editorUpdateRow(row);
+}
+
+/* Editor operations */
+
+void editorInsertChar(int c) {
+  // If the user is at the end of the file, we append a newline before
+  // inserting the character
+  if (E.cy == E.numrows)
+    editorAppendRow("", 0);
+
+  // Insert the character and advance the cursor
+  editorRowInsertChar(&E.row[E.cy], E.cx, c);
+  E.cx++;
+}
+
+/* File i/o */
+
+char *editorRowsToString(int *buflen) {
+  int totlen = 0;
+  for (int j = 0; j < E.numrows; j++) {
+    // +1 for the newlines that we will add at the end of the file
+    totlen += E.row[j].size + 1;
+  }
+  *buflen = totlen;
+
+  char *buf = malloc(totlen);
+  char *p = buf;
+  for (int j = 0; j < E.numrows; j++) {
+    memcpy(p, E.row[j].chars, E.row[j].size);
+    p += E.row[j].size;
+    *p++ = '\n';
+  }
+
+  return buf;
+}
 
 void editorOpen(char *filename) {
   free(E.filename);
@@ -337,7 +388,33 @@ void editorOpen(char *filename) {
   fclose(fp);
 }
 
-/* append buffer */
+void editorSave() {
+  if (E.filename == NULL)
+    return;
+
+  int len;
+  char *buf = editorRowsToString(&len);
+
+  // FIXME: It would be much safer to write to a temporary file and rename it
+  // to prevent data loss if saving doesn't succeed somehow.
+  int fd = open(E.filename, O_RDWR | O_CREAT, 0644);
+  if (fd != -1) {
+    if (ftruncate(fd, len) != -1) {
+      if (write(fd, buf, len) == len) {
+        close(fd);
+        free(buf);
+        editorSetStatusMessage("%d bytes written to disk", len);
+        return;
+      }
+    }
+    close(fd);
+  }
+
+  free(buf);
+  editorSetStatusMessage("Can't save! I/O error: %s", strerror(errno));
+}
+
+/* Append buffer */
 
 struct abuf {
   char *b;
@@ -358,7 +435,7 @@ void abAppend(struct abuf *ab, const char *s, int len) {
 
 void abFree(struct abuf *ab) { free(ab->b); }
 
-/* output */
+/* Output */
 
 void editorScroll() {
   E.rx = 0;
@@ -574,6 +651,11 @@ void editorProcessKeypress() {
   int c = editorReadKey();
 
   switch (c) {
+  case '\r': {
+    // TODO
+    break;
+  }
+
   case CTRL_KEY('q'): {
     // Refer to editorRefreshScreen for what these do
     write(STDOUT_FILENO, "\x1b[2J", 4);
@@ -581,14 +663,28 @@ void editorProcessKeypress() {
     exit(0);
     break;
   }
+
+  case CTRL_KEY('s'): {
+    editorSave();
+    break;
+  }
+
   // Go to the left and right edges of the screen for now
   case HOME_KEY:
     E.cx = 0;
     break;
+
   case END_KEY:
     if (E.cy < E.numrows)
       E.cx = E.row[E.cy].size;
     break;
+
+  case BACKSPACE:
+  case CTRL_KEY('h'):
+  case DEL_KEY:
+    // TODO
+    break;
+
   case PAGE_UP:
   case PAGE_DOWN: {
     // Put the cursor at the very top or bottom of the screen
@@ -607,11 +703,21 @@ void editorProcessKeypress() {
     }
     break;
   }
+
   case ARROW_UP:
   case ARROW_DOWN:
   case ARROW_LEFT:
   case ARROW_RIGHT: {
     editorMoveCursor(c);
+    break;
+  }
+
+  case CTRL_KEY('l'): // Refreshing the screen doesn't make sense
+  case '\x1b':        // Ignore the escape key too
+    break;
+
+  default: {
+    editorInsertChar(c);
     break;
   }
   }
@@ -639,7 +745,7 @@ int main(int argc, char *argv[]) {
   if (argc >= 2)
     editorOpen(argv[1]);
 
-  editorSetStatusMessage("HELP: Ctrl-Q = quit");
+  editorSetStatusMessage("HELP: Ctrl-S = save | Ctrl-Q = quit");
 
   while (1) {
     editorRefreshScreen();

@@ -20,6 +20,7 @@
 
 #define KILO_VERSION "0.0.1"
 #define KILO_TAB_STOP 8
+#define KILO_QUIT_TIMES 3
 #define DEBUG 0
 
 // Strip the 5th and 6th bits from alpha characters to give us something
@@ -62,6 +63,8 @@ struct editorConfig {
   int screencols;
   int numrows;
   erow *row;
+  // Whether the file has unsaved modifications
+  int dirty;
   char *filename;
   // The message we display in the status bar as well as when it was set
   char statusmsg[80];
@@ -301,21 +304,41 @@ void editorUpdateRow(erow *row) {
   row->rsize = idx;
 }
 
-void editorAppendRow(char *s, size_t len) {
+void editorInsertRow(int at, char *s, size_t len) {
+  if (at < 0 || at > E.numrows)
+    return;
+
   E.row = realloc(E.row, sizeof(erow) * (E.numrows + 1));
+  memmove(&E.row[at + 1], &E.row[at], sizeof(erow) * (E.numrows - at));
 
-  int idx = E.numrows;
-  E.row[idx].size = len;
-  E.row[idx].chars = malloc(len + 1);
-  memcpy(E.row[idx].chars, s, len);
-  E.row[idx].chars[len] = '\0';
+  E.row[at].size = len;
+  E.row[at].chars = malloc(len + 1);
+  memcpy(E.row[at].chars, s, len);
+  E.row[at].chars[len] = '\0';
 
-  E.row[idx].rsize = 0;
-  E.row[idx].render = NULL;
+  E.row[at].rsize = 0;
+  E.row[at].render = NULL;
 
-  editorUpdateRow(&E.row[idx]);
+  editorUpdateRow(&E.row[at]);
 
   E.numrows++;
+  // This gives us an idea of how dirty the file is since we aren't using
+  // a boolean
+  E.dirty++;
+}
+
+void editorFreeRow(erow *row) {
+  free(row->render);
+  free(row->chars);
+}
+
+void editorDelRow(int at) {
+  if (at < 0 || at >= E.numrows)
+    return;
+  editorFreeRow(&E.row[at]);
+  memmove(&E.row[at], &E.row[at + 1], sizeof(erow) * (E.numrows - at - 1));
+  E.numrows--;
+  E.dirty++;
 }
 
 void editorRowInsertChar(erow *row, int at, int c) {
@@ -330,6 +353,26 @@ void editorRowInsertChar(erow *row, int at, int c) {
   row->chars[at] = c;
   // Update `render` and `rsize` fields
   editorUpdateRow(row);
+  E.dirty++;
+}
+
+void editorRowAppendString(erow *row, char *s, size_t len) {
+  row->chars = realloc(row->chars, row->size + len + 1);
+  memcpy(&row->chars[row->size], s, len);
+  row->size += len;
+  row->chars[row->size] = '\0';
+  editorUpdateRow(row);
+  E.dirty++;
+}
+
+// Basically do the opposite of editorRowInsertChar
+void editorRowDelChar(erow *row, int at) {
+  if (at < 0 || at >= row->size)
+    return;
+  memmove(&row->chars[at], &row->chars[at + 1], row->size - at);
+  row->size--;
+  editorUpdateRow(row);
+  E.dirty++;
 }
 
 /* Editor operations */
@@ -338,11 +381,49 @@ void editorInsertChar(int c) {
   // If the user is at the end of the file, we append a newline before
   // inserting the character
   if (E.cy == E.numrows)
-    editorAppendRow("", 0);
+    editorInsertRow(E.numrows, "", 0);
 
   // Insert the character and advance the cursor
   editorRowInsertChar(&E.row[E.cy], E.cx, c);
   E.cx++;
+}
+
+void editorInsertNewline() {
+  if (E.cx == 0) {
+    editorInsertRow(E.cy, "", 0);
+  } else {
+    erow *row = &E.row[E.cy];
+    editorInsertRow(E.cy + 1, &row->chars[E.cx], row->size - E.cx);
+    // Fetch again as editorInsertRow calls realloc
+    row = &E.row[E.cy];
+    row->size = E.cx;
+    row->chars[row->size] = '\0';
+    editorUpdateRow(row);
+  }
+  E.cy++;
+  E.cx = 0;
+}
+
+void editorDelChar() {
+  // Nothing to delete past the end of the file
+  if (E.cy == E.numrows)
+    return;
+  // Check if we are at the beginning of the first line
+  if (E.cx == 0 && E.cy == 0)
+    return;
+
+  // See if there is a character to the left of the cursor and delete it
+  erow *row = &E.row[E.cy];
+  if (E.cx > 0) {
+    editorRowDelChar(row, E.cx - 1);
+    E.cx--;
+  } else {
+    // We are at the start of some line
+    E.cx = E.row[E.cy - 1].size;
+    editorRowAppendString(&E.row[E.cy - 1], row->chars, row->size);
+    editorDelRow(E.cy);
+    E.cy--;
+  }
 }
 
 /* File i/o */
@@ -382,10 +463,11 @@ void editorOpen(char *filename) {
     while (linelen > 0 &&
            (line[linelen - 1] == '\r' || line[linelen - 1] == '\n'))
       linelen--;
-    editorAppendRow(line, linelen);
+    editorInsertRow(E.numrows, line, linelen);
   }
   free(line);
   fclose(fp);
+  E.dirty = 0;
 }
 
 void editorSave() {
@@ -403,6 +485,7 @@ void editorSave() {
       if (write(fd, buf, len) == len) {
         close(fd);
         free(buf);
+        E.dirty = 0;
         editorSetStatusMessage("%d bytes written to disk", len);
         return;
       }
@@ -517,8 +600,9 @@ void editorDrawStatusBar(struct abuf *ab) {
   abAppend(ab, "\x1b[7m", 4);
 
   char status[80], rstatus[80];
-  int len = snprintf(status, sizeof(status), "%.20s - %d lines",
-                     E.filename ? E.filename : "[No Name]", E.numrows);
+  int len = snprintf(status, sizeof(status), "%.20s - %d lines %s",
+                     E.filename ? E.filename : "[No Name]", E.numrows,
+                     E.dirty ? "(modified)" : "");
   int rlen = snprintf(rstatus, sizeof(rstatus), "%d/%d", E.cy, E.numrows - 1);
   if (len > E.screencols) {
     len = E.screencols;
@@ -648,15 +732,25 @@ void editorMoveCursor(int key) {
 }
 
 void editorProcessKeypress() {
+  // Hacky way to determine if the user pressed <C-q> N-times in a row
+  static int quit_times = KILO_QUIT_TIMES;
+
   int c = editorReadKey();
 
   switch (c) {
   case '\r': {
-    // TODO
+    editorInsertNewline();
     break;
   }
 
   case CTRL_KEY('q'): {
+    if (E.dirty && quit_times > 0) {
+      editorSetStatusMessage("WARNING!!! File has unsaved changes. "
+                             "Press Ctrl-Q %d more times to quit.",
+                             quit_times);
+      quit_times--;
+      return;
+    }
     // Refer to editorRefreshScreen for what these do
     write(STDOUT_FILENO, "\x1b[2J", 4);
     write(STDOUT_FILENO, "\x1b[H", 3);
@@ -681,9 +775,14 @@ void editorProcessKeypress() {
 
   case BACKSPACE:
   case CTRL_KEY('h'):
-  case DEL_KEY:
-    // TODO
+  case DEL_KEY: {
+    // Quick hack to delete the character on the right of the cursor
+    if (c == DEL_KEY)
+      editorMoveCursor(ARROW_RIGHT);
+
+    editorDelChar();
     break;
+  }
 
   case PAGE_UP:
   case PAGE_DOWN: {
@@ -721,12 +820,14 @@ void editorProcessKeypress() {
     break;
   }
   }
+
+  quit_times = KILO_QUIT_TIMES;
 }
 
 /* Init */
 
 void initEditor() {
-  E.cx = E.cy = E.rx = E.rowoff = E.coloff = E.numrows = 0;
+  E.cx = E.cy = E.rx = E.rowoff = E.coloff = E.numrows = E.dirty = 0;
   E.row = NULL;
   E.filename = NULL;
   E.statusmsg[0] = '\0';
